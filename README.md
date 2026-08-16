@@ -14,9 +14,18 @@ document — twice:
   every call, a Pydantic-enforced output schema (`answerable`, `answer`,
   `supporting_quote`), and a prompt that requires citing the document or
   explicitly saying the answer isn't there.
+- **`otel`** — the same reliable agent as `after`, but with *no tracing code
+  at all*. Observability comes from OpenTelemetry [zero-code
+  auto-instrumentation](https://opentelemetry.io/docs/zero-code/python/)
+  instead of a vendor SDK, so the trace destination is an env var, not a
+  code change — LangSmith, Langfuse, Jaeger, Honeycomb, or any other
+  OTLP-compatible backend all work unmodified.
 
-Both are run through the same LangSmith `evaluate()` dataset and scored with
-the same evaluators, so the difference shows up as numbers, not just prose.
+`before` and `after` are run through the same LangSmith `evaluate()` dataset
+and scored with the same evaluators, so the difference shows up as numbers,
+not just prose. `otel` demonstrates the platform-agnostic alternative to
+`after`'s tracing approach specifically — see [Vendor-neutral tracing with
+OpenTelemetry](#vendor-neutral-tracing-with-opentelemetry) below.
 
 ## Setup
 
@@ -34,6 +43,22 @@ LANGSMITH_TRACING=true
 LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 LANGSMITH_API_KEY=...
 LANGSMITH_PROJECT=reliablellm
+
+# Optional: only needed if you want `otel`'s traces to land somewhere other
+# than stdout. See "Vendor-neutral tracing with OpenTelemetry" below. This
+# example points at LangSmith's own OTLP ingestion endpoint — a plain OTLP
+# HTTP path, separate from the LangSmith SDK/@traceable used by after/.
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.smith.langchain.com/otel
+OTEL_EXPORTER_OTLP_HEADERS=x-api-key=<LANGSMITH_API_KEY>,Langsmith-Project=reliablellm-otel
+```
+
+`opentelemetry-instrument` reads `OTEL_EXPORTER_OTLP_*` from the shell
+environment, not from `.env` directly (nothing in this repo calls
+`load_dotenv()` before it starts) — so before any `otel` run, load `.env`
+into the shell first:
+
+```bash
+set -a && source .env && set +a
 ```
 
 ## Running it
@@ -50,6 +75,27 @@ uv run python -m reliablellm.run_after
 # (once), runs both agents through langsmith.evaluate(), and prints a
 # scored comparison table.
 uv run python -m reliablellm.run_eval
+
+# Vendor-neutral version of run_after — same agent, but traced via OpenTelemetry
+# zero-code auto-instrumentation instead of LangSmith. Must be launched through
+# opentelemetry-instrument, not plain `python`, for spans to be captured.
+# --traces_exporter console just prints spans to stdout, no backend required.
+uv run opentelemetry-instrument \
+    --service_name reliablellm-otel \
+    --traces_exporter console \
+    python -m reliablellm.run_otel
+
+# Same thing, shipped via OTLP instead of stdout (LangSmith's OTLP endpoint
+# by default — see Setup above) — requires the OTEL_EXPORTER_OTLP_* vars from
+# .env to be loaded into the shell first and --traces_exporter switched to
+# otlp_proto_http.
+set -a && source .env && set +a
+uv run opentelemetry-instrument \
+    --service_name reliablellm-otel \
+    --traces_exporter otlp_proto_http \
+    --metrics_exporter none \
+    --logs_exporter none \
+    python -m reliablellm.run_otel
 ```
 
 ## Tracing concepts
@@ -93,6 +139,98 @@ feedback) — `run_before`/`run_after` show you one trace at a time as you'd see
 while `run_eval` runs the whole dataset through `evaluate()` and rolls the feedback up into
 the before-vs-after table.
 
+## Vendor-neutral tracing with OpenTelemetry
+
+`after/agent.py` gets its tracing by importing the LangSmith SDK and wrapping
+the function in `@traceable` — the tracing choice is baked into the code.
+`otel/agent.py` is the same agent (same schema, same prompt, same
+`ChatOpenAI` call) with that import and decorator deleted entirely. It has no
+knowledge that it's being traced at all.
+
+That's the point of OpenTelemetry's [zero-code
+instrumentation](https://opentelemetry.io/docs/zero-code/python/): instead of
+an SDK call inside your code, a launcher process (`opentelemetry-instrument`)
+patches known libraries — here, the `openai` client, via
+`opentelemetry-instrumentation-openai-v2` — before your application ever
+imports them. Every `openai` call anywhere in the process becomes a span,
+including the ones LangChain makes on your behalf, without `otel/agent.py`
+importing an observability package or knowing which backend it's talking to.
+
+**One footnote worth knowing about:** `otel/agent.py` calls
+`with_structured_output(AnalystAnswer, method="function_calling")` instead of
+the library default. The default method routes through the openai SDK's
+`.chat.completions.with_raw_response.parse()`, which the current
+`opentelemetry-instrumentation-openai-v2` release doesn't patch (it only
+wraps `Completions.create` / `AsyncCompletions.create`) — so those calls
+would silently produce zero spans. `function_calling` uses `.create()` with a
+tool call instead, which *is* instrumented. It's a real example of the tradeoff
+zero-code instrumentation makes: no code changes for tracing, but coverage
+depends on which internal method the library happens to call.
+
+### Pointing it at a different backend
+
+Nothing in the code names a destination — it's entirely env vars /
+`opentelemetry-instrument` flags. `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_HEADERS` in `.env` are already set to **LangSmith's own
+OTLP ingestion endpoint** — a plain OTLP HTTP path (`x-api-key` +
+`Langsmith-Project` headers), completely separate from the LangSmith
+SDK/`@traceable` machinery `after/` uses. So once you've loaded `.env` into
+the shell (`set -a && source .env && set +a`), switching between stdout and
+LangSmith is just the one flag:
+
+```bash
+# Print spans to stdout, no backend required:
+uv run opentelemetry-instrument --service_name reliablellm-otel \
+    --traces_exporter console python -m reliablellm.run_otel
+
+# Ship to LangSmith via OTLP instead:
+set -a && source .env && set +a
+uv run opentelemetry-instrument --service_name reliablellm-otel \
+    --traces_exporter otlp_proto_http \
+    --metrics_exporter none --logs_exporter none \
+    python -m reliablellm.run_otel
+```
+
+`Langsmith-Project=reliablellm-otel` routes these into their own project, so
+they don't land in whatever `LANGSMITH_PROJECT` (`datacon` by default) the
+SDK-based `after/` module uses — and since `run_otel.py` explicitly disables
+`LANGSMITH_TRACING`/`LANGCHAIN_TRACING_V2` before calling the agent (see
+below), this OTLP path is the *only* way `otel` traces reach LangSmith; there's
+no double-reporting through the SDK.
+
+**Important:** those two vars have to be in the *shell* environment before
+`opentelemetry-instrument` starts — it configures the exporter at process
+bootstrap, before `run_otel.py`'s own `load_dotenv()` call ever runs, so
+having them only in `.env` without `source`-ing it first silently falls back
+to the default exporter target.
+
+**Also important:** use `--traces_exporter otlp_proto_http`, not the bare
+`otlp`. `otlp` resolves to the **gRPC** OTLP exporter, which talks to
+`host:port` and ignores URL paths — pointed at a path-based endpoint like
+`/otel` it doesn't fail cleanly, it dies mid-run with a grpc
+`_InactiveRpcError` ("Received http2 header with status: 464") the first
+time it tries to flush a batch. `otlp_proto_http` speaks plain OTLP over
+HTTPS to the exact URL in `OTEL_EXPORTER_OTLP_ENDPOINT`, which is what
+LangSmith's (and most SaaS OTLP) endpoints actually expect.
+
+`opentelemetry-instrument` also auto-exports **metrics**, not just traces —
+`opentelemetry-instrumentation-openai-v2` records token-usage metrics
+alongside spans, and `--metrics_exporter` defaults to `otlp` (the same gRPC
+exporter, same failure mode) independently of whatever you passed
+`--traces_exporter`. LangSmith's OTLP endpoint only implements traces
+ingestion, so rather than fighting metrics onto HTTP too, `--metrics_exporter
+none --logs_exporter none` just turns those pipelines off.
+
+Swap `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_HEADERS` for Langfuse,
+Jaeger, Honeycomb, Grafana Tempo, or any other OTLP collector and the same
+command works — `otel/agent.py` never changes.
+
+**Limitation:** this only replaces `after`'s *tracing* mechanism. `run_eval.py`'s
+dataset, `evaluate()`, experiments, and feedback scores are LangSmith
+platform features with no OpenTelemetry equivalent, so there's no
+`run_otel`-based version of that comparison — `otel` mirrors `after/agent.py`
+and `run_after.py` only.
+
 ## What to expect
 
 **`run_before`** — a wall of plain text. Answers are usually plausible, but
@@ -105,6 +243,12 @@ pulled directly from the source document. Out-of-scope questions come back
 `answerable: False` instead of a guess. Every call is traced in LangSmith
 under the `reliablellm-after` project, so you can open a run and see exactly
 what the model saw and produced.
+
+**`run_otel`** — identical structured output to `run_after`, but launched
+through `opentelemetry-instrument`. With `--traces_exporter console` you'll
+see a JSON span (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, etc.)
+printed after each answer instead of a LangSmith URL — same information,
+different transport, zero tracing code in `otel/agent.py`.
 
 **`run_eval`** — prints a table like this, comparing mean scores across the
 shared dataset:
