@@ -13,6 +13,13 @@ correct answers, just with no tracing.
 
 See README.md for how to point the exporter at a real OTel-compatible
 backend (Langfuse, Jaeger, Honeycomb, ...) instead of the console.
+
+Each question is wrapped in its own `production_request` span and scored
+online by online_monitor.py the moment it finishes — see that module for why
+only groundedness and format_compliance run here. This span creation lives
+in the runner, not in otel/agent.py, so the agent itself stays exactly as
+"zero tracing code" as its docstring claims; the online-monitoring wrapper is
+observability infrastructure, not the thing being observed.
 """
 
 import os
@@ -29,14 +36,22 @@ load_dotenv()
 os.environ["LANGSMITH_TRACING"] = "false"
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
+from opentelemetry import trace as otel_trace
+
 from reliablellm.document import EVAL_CASES
+from reliablellm.online_monitor import score_live_call
 from reliablellm.otel.agent import answer_question
+
+_tracer = otel_trace.get_tracer("reliablellm.run_otel")
 
 
 def main() -> None:
     for case in EVAL_CASES:
         print(f"Q: {case['question']}")
-        result = answer_question(case["question"])
+        with _tracer.start_as_current_span("production_request") as span:
+            span.set_attribute("question", case["question"])
+            result = answer_question(case["question"])
+            score_live_call(case["question"], result)
         print(f"answerable: {result.answerable}")
         print(f"answer: {result.answer}")
         print(f"supporting_quote: {result.supporting_quote}")

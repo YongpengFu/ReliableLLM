@@ -1,23 +1,43 @@
 """Run the reliable agent over the eval questions and print the structured,
 grounded answers. Traces to the `reliablellm-after` LangSmith project so it
 can be visually compared against `reliablellm-before`.
+
+Each question is wrapped in its own `production_request` trace, and scored
+online by online_monitor.py the moment it finishes — see that module for
+why only groundedness and format_compliance run here (task_success needs a
+reference_answer this script doesn't have). The score is attached to the
+trace as LangSmith Feedback, so you can filter runs by it in the UI without
+waiting for a batch eval.
 """
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from langsmith.run_helpers import tracing_context
+from langsmith.run_helpers import trace, tracing_context
 
 from reliablellm.after.agent import answer_question
 from reliablellm.document import EVAL_CASES
+from reliablellm.online_monitor import score_live_call
 
 
 def main() -> None:
     with tracing_context(project_name="reliablellm-after"):
         for case in EVAL_CASES:
             print(f"Q: {case['question']}")
-            result = answer_question(case["question"])
+            with trace(
+                name="production_request",
+                run_type="chain",
+                inputs={"question": case["question"]},
+            ) as run:
+                result = answer_question(case["question"])
+                run.end(outputs=result.model_dump())
+                score_live_call(
+                    case["question"],
+                    result,
+                    langsmith_run_id=run.id,
+                    langsmith_project="reliablellm-after",
+                )
             print(f"answerable: {result.answerable}")
             print(f"answer: {result.answer}")
             print(f"supporting_quote: {result.supporting_quote}")

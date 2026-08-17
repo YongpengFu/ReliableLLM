@@ -226,10 +226,53 @@ Jaeger, Honeycomb, Grafana Tempo, or any other OTLP collector and the same
 command works — `otel/agent.py` never changes.
 
 **Limitation:** this only replaces `after`'s *tracing* mechanism. `run_eval.py`'s
-dataset, `evaluate()`, experiments, and feedback scores are LangSmith
+dataset, `evaluate()`, experiments, and batch feedback scores are LangSmith
 platform features with no OpenTelemetry equivalent, so there's no
 `run_otel`-based version of that comparison — `otel` mirrors `after/agent.py`
-and `run_after.py` only.
+and `run_after.py` only. Per-call online scoring (below) is the one piece
+that *does* have an OTel-native equivalent, since it doesn't depend on a
+LangSmith dataset or experiment.
+
+## Online monitoring: catching drift as it happens
+
+`run_eval.py` only scores answers when you remember to run it — against a
+fixed dataset, on your schedule. `online_monitor.py` scores every call
+`run_after.py` and `run_otel.py` make, the moment each one finishes, using
+the same evaluator functions from `after/evaluators.py`:
+
+- **`groundedness`** and **`format_compliance`** run online. Both judge the
+  answer against the source document and its own shape — nothing that
+  requires a pre-written reference answer, which is exactly what's available
+  for a real production call.
+- **`task_success`** stays offline-only, in `run_eval.py`. It compares the
+  answer to a curated `reference_answer`, which production traffic doesn't
+  have.
+
+Both runners now wrap each question in its own `production_request`
+trace/span before calling the agent, so there's something for the online
+monitor to attach the score to once the answer comes back:
+
+- `run_after.py` opens a LangSmith `trace()` per question and passes its
+  `run.id` to `score_live_call()`, which posts each evaluator's result as
+  Feedback on that run via `Client.create_feedback()` — visible in the
+  LangSmith UI immediately, not after the next `run_eval.py` pass.
+- `run_otel.py` opens an OTel span per question with
+  `tracer.start_as_current_span()`; `score_live_call()` writes each score as
+  `online_monitor.<key>.score` (and `.comment`) attributes on that span while
+  it's still current. This lives in the runner, not in `otel/agent.py` — the
+  agent itself stays exactly as "zero tracing code" as advertised above; the
+  monitor is observability infrastructure, not the thing being observed.
+
+Either path also prints `[online-monitor] <key>=<score>` to stdout as it
+happens, with a `<-- FLAGGED` marker on any `False`, so drift is visible in
+the terminal during a live run without opening a dashboard at all.
+
+This is step 1 of a larger drift-detection design (see conversation/talk
+notes): reference-free evaluators scored inline, feeding a rolling
+distribution check that would auto-promote flagged production traces into
+the eval dataset — not implemented here, but `score_live_call()`'s return
+value (raw evaluator outputs per call) is what that aggregation would
+consume.
 
 ## What to expect
 
