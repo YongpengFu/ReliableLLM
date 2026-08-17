@@ -28,6 +28,55 @@ The company did not repurchase any shares during the quarter and did not
 declare a dividend.
 """
 
+DOCUMENT_SECTIONS: list[str] = [
+    section.strip() for section in SOURCE_DOCUMENT.strip().split("\n\n") if section.strip()
+]
+
+
+_SECTION_WORD_SETS = [
+    {w.strip(".,?!'\"()") for w in section.lower().split()} for section in DOCUMENT_SECTIONS
+]
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "was", "were", "is", "are", "did",
+    "how", "what", "in", "of", "to", "on", "at", "by", "with", "during",
+    "much", "company's", "company", "did", "about",
+}
+
+
+def search_document_sections(query: str) -> str:
+    """Return the document paragraphs most relevant to a query, scored by
+    overlap on discriminative words only (query terms that appear in most
+    sections, like "2026" or "quarter", are dropped since they can't tell
+    sections apart). Shared by the after/ and otel/ agents' search_document
+    tool, so both agents have to retrieve grounding evidence via tool calls
+    instead of getting the whole document handed to them upfront."""
+    query_words = {
+        w for w in (t.strip(".,?!'\"()") for t in query.lower().split())
+        if len(w) > 1 and w not in _STOPWORDS
+    }
+    if not query_words:
+        return "No matching sections found in the document."
+
+    n_sections = len(DOCUMENT_SECTIONS)
+    max_matches = max(1, n_sections // 4)
+    discriminative = {
+        w
+        for w in query_words
+        if sum(1 for words in _SECTION_WORD_SETS if w in words) <= max_matches
+    }
+    search_words = discriminative or query_words
+
+    scored = [
+        (len(search_words & words), section)
+        for section, words in zip(DOCUMENT_SECTIONS, _SECTION_WORD_SETS)
+    ]
+    scored = [pair for pair in scored if pair[0] > 0]
+    if not scored:
+        return "No matching sections found in the document."
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return "\n\n".join(section for _, section in scored[:3])
+
+
 EVAL_CASES = [
     {
         "question": "What was total revenue in Q2 2026, and how much did it grow year-over-year?",
