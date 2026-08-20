@@ -19,7 +19,11 @@ online by online_monitor.py the moment it finishes — see that module for why
 only groundedness and format_compliance run here. This span creation lives
 in the runner, not in otel/agent.py, so the agent itself stays exactly as
 "zero tracing code" as its docstring claims; the online-monitoring wrapper is
-observability infrastructure, not the thing being observed.
+observability infrastructure, not the thing being observed. continuous_feedback.py
+takes it further: every score feeds a per-metric EWMA/CUSUM drift tracker,
+auto-promoting flagged calls into the eval dataset when a metric's rolling
+distribution actually drifts — 8 questions isn't enough history to trip it
+here; see run_drift_demo.py for that in action.
 """
 
 import os
@@ -38,8 +42,8 @@ os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 from opentelemetry import trace as otel_trace
 
+from reliablellm.continuous_feedback import observe_live_call
 from reliablellm.document import EVAL_CASES
-from reliablellm.online_monitor import score_live_call
 from reliablellm.otel.agent import answer_question
 
 _tracer = otel_trace.get_tracer("reliablellm.run_otel")
@@ -51,7 +55,7 @@ def main() -> None:
         with _tracer.start_as_current_span("production_request") as span:
             span.set_attribute("question", case["question"])
             result = answer_question(case["question"])
-            score_live_call(case["question"], result)
+            observe_live_call(case["question"], result)
         print(f"answerable: {result.answerable}")
         print(f"answer: {result.answer}")
         print(f"supporting_quote: {result.supporting_quote}")

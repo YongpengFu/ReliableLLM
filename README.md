@@ -27,6 +27,99 @@ not just prose. `otel` demonstrates the platform-agnostic alternative to
 `after`'s tracing approach specifically — see [Vendor-neutral tracing with
 OpenTelemetry](#vendor-neutral-tracing-with-opentelemetry) below.
 
+## The observability & eval lifecycle, end to end
+
+Every piece in this repo is one stage of the same loop: evaluate offline
+before you ship, watch online after you ship, detect drift instead of
+single bad calls, and feed what production teaches you back into the
+offline eval so the benchmark never goes stale. The bottom half is also the
+answer to "the agent suddenly starts giving wrong answers — how do you find
+out why": the alert is what tells you, and the flagged trace is where you
+start looking.
+
+```mermaid
+flowchart TB
+    subgraph dev["1 · Offline eval — before you ship"]
+        direction TB
+        AGENT["Agent code\nafter/agent.py, otel/agent.py"]
+        DATASET[("Dataset: reliablellm-analyst-qa")]
+        EVALRUN["run_eval.py\nlangsmith.evaluate()"]
+        EVALFEED["Feedback per run:\ngroundedness · task_success · format_compliance"]
+        GATE{"Regressed vs.\nlast experiment?"}
+        AGENT --> EVALRUN
+        DATASET --> EVALRUN
+        EVALRUN --> EVALFEED --> GATE
+        GATE -- "no" --> SHIP(["Ship it"])
+        GATE -- "yes" --> FIXDEV["Fix before merging"]
+        FIXDEV --> AGENT
+    end
+
+    subgraph prod["2 · Online — every live call"]
+        direction TB
+        TRAFFIC["Live question"]
+        SPAN["production_request trace/span\nrun_after.py / run_otel.py"]
+        ANSWER["Agent answer"]
+        ONLINE["online_monitor.py\ngroundedness + format_compliance\n(reference-free — no ground truth needed)"]
+        TRAFFIC --> SPAN --> ANSWER --> ONLINE
+        ONLINE -. "Feedback / span attrs" .-> SPAN
+    end
+
+    SHIP --> TRAFFIC
+
+    subgraph drift["3 · Continuous monitoring — track the distribution"]
+        direction TB
+        TRACKER["drift_monitor.DriftTracker\nEWMA + CUSUM, per metric"]
+        SHIFT{"Sustained shift,\nnot one bad call?"}
+        TRACKER --> SHIFT
+        SHIFT -- "no — noise" --> TRACKER
+        SHIFT -- "yes — new_alert" --> ALERT{{"DRIFT ALERT\n(fires once per incident)"}}
+    end
+
+    ONLINE --> TRACKER
+
+    subgraph incident["4 · Troubleshoot: answers are suddenly wrong"]
+        direction TB
+        PAGE["On-call sees the alert"]
+        OPEN["Open the flagged trace\n(LangSmith UI / OTel backend)"]
+        INSPECT["Inspect nested spans:\nprompt · tool calls · retrieved excerpts · model/version"]
+        CORRELATE["Correlate drift-onset time\nwith recent deploys / config / prompt changes"]
+        CAUSE["Narrow the cause:\nprompt edit · model swap ·\nretrieval or source-doc change · upstream API change"]
+        HOTFIX["Apply the fix"]
+        PAGE --> OPEN --> INSPECT --> CORRELATE --> CAUSE --> HOTFIX
+    end
+
+    ALERT --> PAGE
+
+    subgraph loop["5 · Close the loop"]
+        direction TB
+        PROMOTE["eval_promotion.py\npromotes the flagged calls into\nreliablellm-analyst-qa\n(needs_review: true, no reference_answer yet)"]
+        REVIEW["Human backfills reference_answer,\nclears needs_review"]
+        PROMOTE --> REVIEW
+    end
+
+    ALERT --> PROMOTE
+    REVIEW --> DATASET
+    HOTFIX -. "re-run offline eval to confirm —\nnow includes the new regression case" .-> EVALRUN
+```
+
+Two details worth calling out:
+
+- **Why online eval can't just reuse the offline evaluators.** `task_success`
+  needs a `reference_answer` a human wrote in advance — production traffic
+  doesn't have one. Only `groundedness` and `format_compliance` are
+  reference-free, so those are the two that run online; see [Online
+  monitoring](#online-monitoring-catching-drift-as-it-happens) below.
+- **Why the loop detects a *shift*, not a *sample*.** A single bad
+  `groundedness=False` is usually just a hard question. What actually says
+  "the agent regressed" is the rolling distribution moving — which is what
+  turns a noisy per-call signal into a single, trustworthy alert instead of
+  paging on every hard question. See
+  [drift_monitor.py](#tracking-the-distribution-not-the-sample--drift_monitorpy).
+
+`run_drift_demo.py` runs this exact loop end to end against a simulated
+regression — see [Seeing it happen](#seeing-it-happen--run_drift_demopy)
+below.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.13+.
@@ -248,31 +341,122 @@ the same evaluator functions from `after/evaluators.py`:
   answer to a curated `reference_answer`, which production traffic doesn't
   have.
 
-Both runners now wrap each question in its own `production_request`
-trace/span before calling the agent, so there's something for the online
-monitor to attach the score to once the answer comes back:
+Both runners wrap each question in its own `production_request` trace/span
+before calling the agent, so there's something for the online monitor to
+attach the score to once the answer comes back:
 
 - `run_after.py` opens a LangSmith `trace()` per question and passes its
-  `run.id` to `score_live_call()`, which posts each evaluator's result as
-  Feedback on that run via `Client.create_feedback()` — visible in the
-  LangSmith UI immediately, not after the next `run_eval.py` pass.
+  `run.id` (and the resolved `session_id`, to keep `create_feedback` off the
+  deprecated no-session path) down the chain, which eventually posts each
+  evaluator's result as Feedback on that run — visible in the LangSmith UI
+  immediately, not after the next `run_eval.py` pass.
 - `run_otel.py` opens an OTel span per question with
-  `tracer.start_as_current_span()`; `score_live_call()` writes each score as
-  `online_monitor.<key>.score` (and `.comment`) attributes on that span while
-  it's still current. This lives in the runner, not in `otel/agent.py` — the
-  agent itself stays exactly as "zero tracing code" as advertised above; the
-  monitor is observability infrastructure, not the thing being observed.
+  `tracer.start_as_current_span()`; the score gets written as
+  `online_monitor.<key>.score` (and `.comment`) attributes on that span
+  while it's still current. This lives in the runner, not in
+  `otel/agent.py` — the agent itself stays exactly as "zero tracing code"
+  as advertised above; the monitor is observability infrastructure, not the
+  thing being observed.
 
-Either path also prints `[online-monitor] <key>=<score>` to stdout as it
-happens, with a `<-- FLAGGED` marker on any `False`, so drift is visible in
-the terminal during a live run without opening a dashboard at all.
+Either path prints `[online-monitor] <key>=<score>` to stdout as it happens,
+with a `<-- FLAGGED` marker on any `False`, so a single bad score is visible
+in the terminal without opening a dashboard. But a single bad score, on its
+own, is *not* drift — that's what the next two pieces are for.
 
-This is step 1 of a larger drift-detection design (see conversation/talk
-notes): reference-free evaluators scored inline, feeding a rolling
-distribution check that would auto-promote flagged production traces into
-the eval dataset — not implemented here, but `score_live_call()`'s return
-value (raw evaluator outputs per call) is what that aggregation would
-consume.
+### Tracking the distribution, not the sample — `drift_monitor.py`
+
+A lone `groundedness=False` is usually just a hard question, not a
+regression. `drift_monitor.DriftTracker` runs two textbook
+statistical-process-control detectors over each metric's score stream and
+only calls it drift when one of them trips:
+
+- **EWMA** (exponentially weighted moving average) — smooths the noisy 0/1
+  stream and alerts once the smoothed value falls a fixed margin below the
+  healthy baseline. Catches a gradual decline.
+- **CUSUM** (cumulative sum) — accumulates each sample's deviation below
+  baseline, net of a small allowed slack, and alerts once the running total
+  passes a threshold. A single bad sample gets mostly absorbed by the slack;
+  a *sustained* run of them doesn't, because a passing sample only pulls the
+  sum back toward zero by the slack amount, not all the way.
+
+The first `BURN_IN` samples just establish the baseline mean (no alerting
+yet); after that, both detectors are unnormalized — measured directly in
+probability space rather than divided by an estimated variance — because a
+real "healthy" groundedness rate is often a literal 1.0 during burn-in,
+which would collapse a variance-normalized control band to zero width and
+alert on the very next blip. Once alerted, `new_alert` debounces further
+reporting: `alert` stays `True` for as long as the shift persists (used to
+keep promoting evidence, see below), but the loud "drift detected" signal
+only fires once, on the healthy→drifted transition — not once per call for
+the whole length of an incident.
+
+### Closing the loop — `eval_promotion.py`
+
+When a metric drifts, `continuous_feedback.py` (the module that wires
+`online_monitor` → `drift_monitor` → `eval_promotion` together, and the one
+`run_after.py`/`run_otel.py` actually call — `observe_live_call()`, in
+place of calling `online_monitor.score_live_call()` directly) pulls the
+recent calls in its rolling window that scored `False` on the drifting
+metric and hasn't already been promoted, and hands them to
+`eval_promotion.promote_flagged_calls()`. That writes each one into
+`reliablellm-analyst-qa` — the same dataset `run_eval.py` scores against —
+as a new Example, tagged in `metadata` with `source: production-drift`,
+`flagged_metric`, the original run id, and `needs_review: true`.
+
+They come in with `reference_answer: null` on purpose: production has no
+ground truth, and `task_success` (the only evaluator that needs one) would
+just be scoring against a fabricated target. Landing with no reference
+still makes them immediately useful for `groundedness`/`format_compliance`
+in the next `run_eval.py` pass, and ready for a human to backfill a real
+reference answer and clear the flag whenever someone gets to it. This is
+the mechanism that keeps the benchmark growing from what production is
+actually seeing, instead of staying frozen at whatever `EVAL_CASES` looked
+like when someone last hand-wrote it.
+
+### Seeing it happen — `run_drift_demo.py`
+
+`run_after.py` and `run_otel.py` only run 8 questions — not enough history
+to realistically trip a distribution check, and the real agent is accurate
+enough that it shouldn't drift in a short demo anyway. `run_drift_demo.py`
+simulates the failure instead of waiting for it:
+
+```bash
+uv run python -m reliablellm.run_drift_demo
+```
+
+It runs a **healthy** phase (the real questions through the real
+`after/agent.py`, to establish the baseline) followed by a **drifted**
+phase that skips the real agent and returns one fixed, fluent, entirely
+fabricated `AnalystAnswer` for every question — standing in for a real
+failure mode (a bad deploy, a prompt regression, a swapped model that stops
+actually reading the document) where the agent keeps answering confidently
+and incorrectly instead of erroring out somewhere loud.
+`online_monitor.py`'s judge still runs for real against these, so what
+catches it is the actual EWMA/CUSUM math, not a canned result. Watch for
+`ewma`/`cusum` sinking through the drifted phase, one `<-- DRIFT ALERT
+(new)` line, then repeated `promoting N flagged call(s) ... into the eval
+dataset` — while `format_compliance` stays perfectly healthy throughout,
+since the fabricated answer is still a well-formed object. That split is
+the point: each metric is tracked, and alerts, independently. Traces land
+in the `reliablellm-drift-demo` LangSmith project, separate from
+`reliablellm-after`, so a demo run never mixes into the real one.
+
+**Heads up:** this script *will* write new Examples into
+`reliablellm-analyst-qa` (the same dataset `run_eval.py` uses) — that's the
+point, but it means re-running the demo repeatedly grows that dataset with
+duplicate synthetic entries each time. Clean up afterward if you don't want
+them there:
+
+```python
+from langsmith import Client
+from reliablellm.run_eval import DATASET_NAME
+
+client = Client()
+dataset = client.read_dataset(dataset_name=DATASET_NAME)
+for example in client.list_examples(dataset_id=dataset.id):
+    if (example.metadata or {}).get("source") == "production-drift":
+        client.delete_example(example.id)
+```
 
 ## What to expect
 
